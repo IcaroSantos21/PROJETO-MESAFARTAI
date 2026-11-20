@@ -15,6 +15,11 @@ Ciclo de vida da doação (doacoes.status):
 
 Cada opção sugerida (matches.status): SUGERIDO -> ACEITO | RECUSADO
 
+Colunas de resumo em `doacoes` (alimentam o dashboard com SUM/SELECT reais, sem números fixos):
+    quantidade_kg -> soma dos itens em kg (g é convertido; L, caixa, dúzia... não são comparáveis e ficam de fora)
+    urgencia      -> ALTA (vence em até 1 dia) | MEDIA (até 7 dias) | BAIXA (mais de 7 dias ou sem validade)
+    ong_destino   -> nome da ONG que aceitou; 'Aguardando ONG' enquanto não há resposta; 'Sem destino' se recusada
+
 IMPORTANTE: o login do administrador NÃO fica aqui. Usuário e hash da senha ficam em
 st.secrets (ou variáveis de ambiente), nunca no banco nem no GitHub.
 
@@ -47,6 +52,9 @@ ROTULOS_RESTRICAO = {
 SEM_RESTRICOES = "sem restrições"
 STATUS_DOACAO = ("DISPONIVEL", "MATCH_SUGERIDO", "ACEITA", "SEM_DESTINO", "COLETADA")
 STATUS_MATCH = ("SUGERIDO", "ACEITO", "RECUSADO")
+URGENCIAS = ("ALTA", "MEDIA", "BAIXA")
+ONG_AGUARDANDO = "Aguardando ONG"
+ONG_SEM_DESTINO = "Sem destino"
 
 _RE_EMAIL = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
 
@@ -166,7 +174,10 @@ CREATE TABLE IF NOT EXISTS doacoes (
     mensagem_original TEXT,
     consentimento_lgpd INTEGER NOT NULL CHECK (consentimento_lgpd = 1),
     status TEXT NOT NULL DEFAULT 'DISPONIVEL' CHECK (status IN ({_sql_in(STATUS_DOACAO)})),
-    criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    quantidade_kg REAL NOT NULL DEFAULT 0,
+    urgencia TEXT NOT NULL DEFAULT 'BAIXA',
+    ong_destino TEXT NOT NULL DEFAULT '{ONG_AGUARDANDO}'
 );
 
 CREATE TABLE IF NOT EXISTS itens_doacao (
@@ -234,6 +245,74 @@ def _backup_banco_legado():
         print(f" Banco da versão antiga preservado em '{destino.name}'. Criando o novo esquema.")
 
 
+def _hoje():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    except Exception:
+        return datetime.now().date()
+
+
+def calcular_urgencia(data_validade, hoje=None):
+    """ALTA: vence em até 1 dia (ou já venceu) | MEDIA: até 7 dias | BAIXA: mais que isso ou sem validade."""
+    if not data_validade:
+        return "BAIXA"
+    try:
+        validade = datetime.strptime(str(data_validade)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return "BAIXA"
+    dias = (validade - (hoje or _hoje())).days
+    if dias <= 1:
+        return "ALTA"
+    return "MEDIA" if dias <= 7 else "BAIXA"
+
+
+def calcular_quantidade_kg(itens):
+    """Soma só o que é comparável em peso: kg e g (convertido). Litros, caixas etc. não entram."""
+    total = 0.0
+    for it in itens:
+        qtd = it.get("quantidade")
+        if qtd is None:
+            continue
+        if it.get("unidade") == "kg":
+            total += float(qtd)
+        elif it.get("unidade") == "g":
+            total += float(qtd) / 1000
+    return round(total, 3)
+
+
+_COLUNAS_RESUMO = {  # colunas acrescentadas à tabela doacoes depois da primeira versão
+    "quantidade_kg": "REAL NOT NULL DEFAULT 0",
+    "urgencia": "TEXT NOT NULL DEFAULT 'BAIXA'",
+    "ong_destino": f"TEXT NOT NULL DEFAULT '{ONG_AGUARDANDO}'",
+}
+
+
+def _migrar_colunas_resumo(conn):
+    """Bancos antigos: acrescenta as colunas de resumo e preenche as doações que já existiam."""
+    existentes = {c["name"] for c in conn.execute("PRAGMA table_info(doacoes)")}
+    novas = [c for c in _COLUNAS_RESUMO if c not in existentes]
+    for coluna in novas:
+        conn.execute(f"ALTER TABLE doacoes ADD COLUMN {coluna} {_COLUNAS_RESUMO[coluna]}")
+    if not novas:
+        return
+    conn.execute(
+        """UPDATE doacoes SET quantidade_kg = COALESCE((
+               SELECT SUM(CASE unidade WHEN 'kg' THEN quantidade WHEN 'g' THEN quantidade / 1000.0 ELSE 0 END)
+               FROM itens_doacao WHERE doacao_id = doacoes.id), 0)""")
+    conn.execute(
+        """UPDATE doacoes SET ong_destino = COALESCE((
+               SELECT o.nome FROM matches m JOIN ongs o ON o.id = m.ong_id
+               WHERE m.doacao_id = doacoes.id AND m.status = 'ACEITO'),
+               CASE WHEN status = 'SEM_DESTINO' THEN ? ELSE ? END)""", (ONG_SEM_DESTINO, ONG_AGUARDANDO))
+    for r in conn.execute("SELECT id, data_validade, criado_em FROM doacoes").fetchall():
+        try:  # a urgência é medida na data em que a doação foi feita
+            base = datetime.strptime(str(r["criado_em"])[:10], "%Y-%m-%d").date()
+        except ValueError:
+            base = None
+        conn.execute("UPDATE doacoes SET urgencia = ? WHERE id = ?", (calcular_urgencia(r["data_validade"], base), r["id"]))
+
+
 def inicializar_banco(inserir_seeds=True):
     """Cria as tabelas (se não existirem) e, opcionalmente, as ONGs de demonstração."""
     _backup_banco_legado()
@@ -242,6 +321,7 @@ def inicializar_banco(inserir_seeds=True):
         colunas = {c["name"] for c in conn.execute("PRAGMA table_info(cache_geocodificacao)")}
         if "detalhes" not in colunas:  # bancos criados antes desta coluna
             conn.execute("ALTER TABLE cache_geocodificacao ADD COLUMN detalhes TEXT")
+        _migrar_colunas_resumo(conn)
         total = conn.execute("SELECT COUNT(*) FROM ongs").fetchone()[0]
     if inserir_seeds and total == 0:
         for ong in SEEDS_ONGS:
@@ -371,15 +451,17 @@ def registrar_doacao(doador_nome, doador_email, consentimento_lgpd, itens, categ
     categorias_txt = ", ".join(c for c in CATEGORIAS_ALIMENTO if c in set(categorias)) or None
     descricao = (descricao_alimento or _descrever_itens(itens)).strip()
     cep_norm = normalizar_cep(cep) if cep else None
+    quantidade_kg = calcular_quantidade_kg(itens)
+    urgencia = calcular_urgencia(data_validade)
 
-    with sessao() as conn:
+    with sessao() as conn:  # commit automático no sucesso, rollback no erro
         cur = conn.execute(
             """INSERT INTO doacoes (doador_nome, doador_email, descricao_alimento, categorias, data_validade,
                                     cep, endereco_texto, latitude, longitude, mensagem_original,
-                                    consentimento_lgpd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,1)""",
+                                    consentimento_lgpd, quantidade_kg, urgencia)
+               VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)""",
             (doador_nome, doador_email, descricao, categorias_txt, data_validade, cep_norm, endereco_texto,
-             latitude, longitude, mensagem_original))
+             latitude, longitude, mensagem_original, quantidade_kg, urgencia))
         doacao_id = cur.lastrowid
         conn.executemany(
             "INSERT INTO itens_doacao (doacao_id, alimento, quantidade, unidade, categorias) VALUES (?,?,?,?,?)",
@@ -415,14 +497,20 @@ def responder_match(match_id, aceito):
         conn.execute("UPDATE matches SET status = ?, data_resposta = CURRENT_TIMESTAMP WHERE id = ?",
                      ("ACEITO" if aceito else "RECUSADO", match_id))
         if aceito:
-            conn.execute("UPDATE doacoes SET status = 'ACEITA' WHERE id = ?", (m["doacao_id"],))
+            conn.execute(
+                """UPDATE doacoes SET status = 'ACEITA',
+                          ong_destino = (SELECT o.nome FROM matches mt JOIN ongs o ON o.id = mt.ong_id
+                                         WHERE mt.id = ?)
+                   WHERE id = ?""", (match_id, m["doacao_id"]))
         elif m["ordem"] == 2:
-            conn.execute("UPDATE doacoes SET status = 'SEM_DESTINO' WHERE id = ?", (m["doacao_id"],))
+            conn.execute("UPDATE doacoes SET status = 'SEM_DESTINO', ong_destino = ? WHERE id = ?",
+                         (ONG_SEM_DESTINO, m["doacao_id"]))
 
 
 def marcar_sem_destino(doacao_id):
     with sessao() as conn:
-        conn.execute("UPDATE doacoes SET status = 'SEM_DESTINO' WHERE id = ?", (doacao_id,))
+        conn.execute("UPDATE doacoes SET status = 'SEM_DESTINO', ong_destino = ? WHERE id = ?",
+                     (ONG_SEM_DESTINO, doacao_id))
 
 
 def marcar_coletada(doacao_id):
@@ -470,6 +558,15 @@ def listar_doacoes():
                LEFT JOIN ongs o ON o.id = m.ong_id
                ORDER BY d.criado_em DESC""").fetchall()
     return [dict(l) for l in linhas]
+
+
+def total_kg_doado(desde_utc=None):
+    """Soma real de quantidade_kg no banco. desde_utc ('AAAA-MM-DD HH:MM:SS', UTC) limita o período."""
+    sql, params = "SELECT COALESCE(SUM(quantidade_kg), 0) FROM doacoes", ()
+    if desde_utc:
+        sql, params = sql + " WHERE criado_em >= ?", (desde_utc,)
+    with sessao() as conn:
+        return float(conn.execute(sql, params).fetchone()[0])
 
 
 def listar_itens():

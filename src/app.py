@@ -110,6 +110,10 @@ def enviar(conversa, texto):
         st.markdown(texto)
     with st.spinner("Pensando..."):
         conversa.enviar(texto)
+    nlu = MotorNLU()
+    confianca = nlu.processar_mensagem(texto).get("confianca", 0)
+    st.progress(float(confianca), text=f"Confiança da IA(NLU): {confianca * 100:.1f}%")
+    st.toast("Mensagem processada pelo assistente!", icon="✌")
     st.rerun()
 
 
@@ -242,10 +246,12 @@ def dashboard():
     periodo = st.segmented_control("Período", ["Últimos 7 dias", "Últimos 30 dias", "Tudo"], default="Tudo",
                                    key="dash_periodo") or "Tudo"
     doacoes["data"] = _para_local(doacoes["criado_em"])
+    desde_utc = None  # "Tudo" -> sem filtro na consulta SQL
     if periodo != "Tudo":
         dias = 7 if "7" in periodo else 30
         limite = pd.Timestamp.now(tz=doacoes["data"].dt.tz) - timedelta(days=dias)
         doacoes = doacoes[doacoes["data"] >= limite]
+        desde_utc = limite.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S")
     if doacoes.empty:
         st.info("Nenhuma doação neste período.")
         return
@@ -259,15 +265,18 @@ def dashboard():
     aceitas = int(doacoes["status"].isin(["ACEITA", "COLETADA"]).sum())
     sem_destino = int((doacoes["status"] == "SEM_DESTINO").sum())
     dist_media = matches.loc[matches["status"] == "ACEITO", "distancia_km"].mean() if not matches.empty else float("nan")
-    kg = itens.loc[itens["unidade"] == "kg", "quantidade"].sum() if not itens.empty else 0
+    kg = db.total_kg_doado(desde_utc)  # SELECT COALESCE(SUM(quantidade_kg), 0) FROM doacoes
+    urgentes = int((doacoes["urgencia"] == "ALTA").sum())
 
-    m = st.columns(5)
+    m = st.columns(6)
     m[0].metric("Doações registradas", total)
     m[1].metric("Aceitas pelo doador", aceitas, f"{aceitas / total:.0%} do total", delta_color="off")
     m[2].metric("Sem destino", sem_destino, f"{sem_destino / total:.0%} do total", delta_color="off")
     m[3].metric("Distância média (aceitas)", "—" if pd.isna(dist_media) else f"{dist_media:.1f} km".replace(".", ","))
-    m[4].metric("Itens em kg", f"{kg:g} kg", help="Soma só os itens informados em kg; litros, caixas e "
-                                                  "dúzias não são somados porque não são comparáveis.")
+    m[4].metric("Total doado", f"{kg:,.1f} kg".replace(",", "X").replace(".", ",").replace("X", "."),
+                help="Soma de quantidade_kg no banco: considera itens em kg e g; litros, caixas e "
+                     "dúzias não são somados porque não são comparáveis.")
+    m[5].metric("Urgência alta", urgentes, help="Doações que vencem em até 1 dia.")
     st.divider()
 
     c1, c2 = st.columns(2)
@@ -278,6 +287,17 @@ def dashboard():
     with c2:
         st.subheader("Doações por situação")
         st.bar_chart(doacoes["status"].value_counts())
+
+    st.subheader("Doações por urgência")
+    ordem_urg = ["ALTA", "MEDIA", "BAIXA"]
+    st.bar_chart(doacoes["urgencia"].value_counts().reindex(ordem_urg, fill_value=0))
+
+    st.subheader("Doações registradas")
+    st.dataframe(
+        doacoes[["protocolo", "descricao_alimento", "quantidade_kg", "data_validade", "urgencia", "ong_destino",
+                 "status"]].rename(columns={"descricao_alimento": "alimento", "data_validade": "validade",
+                                            "quantidade_kg": "kg", "urgencia": "urgência", "ong_destino": "ONG destino"}),
+        width="stretch", hide_index=True)
 
     c3, c4 = st.columns(2)
     with c3:
@@ -324,6 +344,9 @@ def dashboard():
         st.dataframe(tab.rename(columns={"unidade": "unidade"}), width="stretch", hide_index=True)
 
     mapa_ongs(ongs_ativas, doacoes)
+
+    st.subheader("Distribuição Geográfica das ONGs")
+    st.map(ongs)
 
 
 def mapa_ongs(ongs_ativas, doacoes):
@@ -498,9 +521,9 @@ def aba_registro_doacoes():
         vis = vis[alvo.str.contains(busca.strip().lower(), regex=False)]
 
     tabela = vis[["protocolo", "registrada em", "doador_nome", "doador_email", "descricao_alimento", "categorias",
-                  "data_validade", "status", "ong_aceita", "distancia_aceita"]].rename(columns={
+                  "data_validade", "urgencia", "status", "ong_aceita", "distancia_aceita"]].rename(columns={
         "doador_nome": "doador", "doador_email": "e-mail", "descricao_alimento": "itens",
-        "data_validade": "validade", "ong_aceita": "ONG", "distancia_aceita": "km"})
+        "data_validade": "validade", "urgencia": "urgência", "ong_aceita": "ONG", "distancia_aceita": "km"})
     st.dataframe(tabela, width="stretch", hide_index=True)
     st.download_button("⬇️ Baixar CSV (contém dados pessoais: use com cuidado)",
                        tabela.to_csv(index=False).encode("utf-8-sig"), "doacoes_mesafartai.csv", "text/csv")
@@ -534,10 +557,16 @@ def aba_registro_doacoes():
 def main():
     s = servicos()
     garantir_banco()
-    st.sidebar.title("🍽️ MESAFARTAI")
+    st.sidebar.image("assets/logo_mesafartai.png", width=180)
+    st.sidebar.title("MESAFARTAI")
+    st.sidebar.info("ODS 2 - Fome zero")
     st.sidebar.caption("Conectando quem tem alimento a quem combate a fome.")
+    st.sidebar.caption("👥 Icaro Rodrigues, Rafael Celestino, Adrian Guerrero")
     pagina = st.sidebar.radio("Menu", ["💬 Quero doar", "🔎 Acompanhar doação", "ℹ️ Como funciona", "🔐 Administração"],
                               key="menu")
+    if st.sidebar.button(" Limpar Conversa"):
+        st.session_state.historico = []
+        st.rerun()
     if pagina == "💬 Quero doar" and st.sidebar.button("🔄 Nova conversa", width="stretch"):
         st.session_state.pop("conversa", None)
         st.rerun()
